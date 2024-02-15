@@ -3,8 +3,10 @@ Programa para participar da Rinha backend 2024 - Q1 (https://github.com/zanfranc
 
 # Stack
 
+```
 Banco de Dados - PostgreSQL
 Linguagem - Go
+```
 
 # Estratégia
 
@@ -19,10 +21,16 @@ Linguagem - Go
 # Exemplos
 
 ## Transação
-curl -d '{"valor": 1000, "tipo" : "c", "descricao" : "sasdo"}' -H "Content-Type: application/json" -X POST http://localhost:8080/clientes/1/transacoes
+
+```
+curl -d '{"valor": 1000, "tipo" : "c", "descricao" : "sasdo"}' -H "Content-Type: application/json" -X POST http://localhost:8081/clientes/1/transacoes
+```
 
 ## Extrato
-curl -d '{"valor": 1000, "tipo" : "c", "descricao" : "descricao"}' -H "Content-Type: application/json" -X GET http://localhost:8080/clientes/1/extrato
+
+```
+curl -H "Content-Type: application/json" -X GET http://localhost:8081/clientes/1/extrato
+```
 
 # Build imagem Docker
 
@@ -35,6 +43,7 @@ docker run -it --rm --net="host" rinha-backend-2024-q1-go
 # Push to Docker Hub
 
 docker tag rinha-backend-2024-q1-go hfurlan/rinha-backend-2024-q1:1.0.0-go
-docker push hfurlan/rinha-backend-2024-q1:1.0.0
+docker push hfurlan/rinha-backend-2024-q1:1.0.0-go
+
 
 

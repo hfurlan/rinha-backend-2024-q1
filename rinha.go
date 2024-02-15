@@ -21,6 +21,10 @@ var db *sql.DB
 var clientesLimites = make(map[int]int)
 var clientesSaldosIniciais = make(map[int]int)
 var clientesDadosAtualizando = false //map em Go nao eh thread-safe
+var modo_ping_on = false
+var modo_ping_validacao_on = false
+var modo_ping_transacoes_only = false
+var modo_ping_transacoes_insert_only = false
 
 func init() {
 	db_username := os.Getenv("DB_USERNAME")
@@ -39,13 +43,24 @@ func init() {
 	if db_name == "" {
 		db_name = "rinha"
 	}
+	db_max_connections_str := os.Getenv("DB_MAX_CONNECTIONS")
+	if db_max_connections_str == "" {
+		db_max_connections_str = "10"
+	}
+	db_max_connections, err := strconv.Atoi(db_max_connections_str)
+	if err != nil {
+		// ... handle error
+		panic(err)
+	}
+
 	fmt.Println("Conectando no BD...")
 	fmt.Println("DB_HOSTNAME:" + db_hostname)
 	fmt.Println("DB_NAME:" + db_name)
 	fmt.Println("DB_USERNAME:" + db_username)
+	fmt.Println("DB_MAX_CONNECTIONS:" + db_max_connections_str)
 
-	var err error
 	db, err = sql.Open("postgres", "postgres://"+db_username+":"+db_password+"@"+db_hostname+"/"+db_name+"?sslmode=disable")
+	db.SetMaxOpenConns(db_max_connections)
 	if err != nil {
 		log.Fatal("Invalid DB config:", err)
 	}
@@ -53,9 +68,38 @@ func init() {
 		log.Fatal("DB unreachable:", err)
 	}
 	fmt.Println("Conectado OK!!!")
+
+	if os.Getenv("PING_ON") != "" {
+		modo_ping_on = true
+		fmt.Println("**** EXECUTANDO EM MODO PING ****")
+	}
+
+	if os.Getenv("PING_VALIDACAO_ON") != "" {
+		modo_ping_validacao_on = true
+		fmt.Println("**** EXECUTANDO EM MODO PING VALIDACAO (SEM ACESSO AO BD) ****")
+	}
+
+	if os.Getenv("PING_TRANSACOES_ONLY_ON") != "" {
+		modo_ping_transacoes_only = true
+		fmt.Println("**** EXECUTANDO EM MODO PING COM VALIDACAO E COM A EXECUCAO REAL SOMENTE DO ENPOINT /transacoes ****")
+	}
+
+	if os.Getenv("PING_TRANSACOES_INSERT_ONLY_ON") != "" {
+		modo_ping_transacoes_insert_only = true
+		fmt.Println("**** EXECUTANDO EM MODO PING COM VALIDACAO E COM A EXECUCAO REAL SOMENTE DO ENPOINT /transacoes POREM SOMENTE COM AS INSTRUCOES SQL DE TRANSACOES EXECUTANDO ****")
+	}
 }
 
 func handle_generico(w http.ResponseWriter, r *http.Request) {
+	if modo_ping_on {
+		if strings.Contains(r.URL.Path, "extrato") {
+			io.WriteString(w, "{\"saldo\": {\"total\": -9098,\"data_extrato\": \"2024-01-17T02:34:41.217753Z\",\"limite\":100000},\"ultimas_transacoes\": [{\"valor\": 10,\"tipo\":\"c\",\"descricao\":\"descricao\",\"realizada_em\":\"2024-01-17T02:34:38.543030Z\"}]}")
+		} else {
+			io.WriteString(w, "{\"limite\": 1000, \"saldo\": 1000}")
+		}
+		return
+	}
+
 	id, tipo_transacao := obter_dados_rota(r.URL.Path)
 	if tipo_transacao == "transacoes" && r.Method == "POST" {
 		handle_transacoes(w, r, id)
@@ -79,18 +123,17 @@ func handle_transacoes(w http.ResponseWriter, r *http.Request, id int) {
 	var resB bytes.Buffer
 	_, err := resB.ReadFrom(r.Body)
 	if err != nil {
-		fmt.Println(err)
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("500 - Internal Server Error"))
+		w.Write([]byte("500 - Internal Server Error - resB.ReadFrom(r.Body) - " + err.Error()))
 		return
 	}
 
 	var transacao Transacao
 	err = json.Unmarshal(resB.Bytes(), &transacao)
 	if err != nil {
-		fmt.Println(err)
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("500 - Internal Server Error"))
+		fmt.Println("Erro ao tratar json de entrada - " + err.Error())
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		w.Write([]byte("422 - Erro ao tratar json de entrada - " + err.Error()))
 		return
 	}
 
@@ -113,35 +156,50 @@ func handle_transacoes(w http.ResponseWriter, r *http.Request, id int) {
 		return
 	}
 
+	if modo_ping_validacao_on {
+		io.WriteString(w, "{\"limite\": 1000, \"saldo\": 1000}")
+		return
+	}
+
 	var saldo int
-	if transacao.Tipo == "c" {
-		err := db.QueryRow(`with novo_saldo as (UPDATE saldos SET saldo = saldo + $1 WHERE cliente_id = $2 RETURNING saldo) insert into transacoes (cliente_id, valor, descricao, tipo, saldo) values ($3, $4, $5, $6, (select * from novo_saldo)) returning saldo`, transacao.Valor, id, id, transacao.Valor, transacao.Descricao, transacao.Tipo).Scan(&saldo)
+	if modo_ping_transacoes_insert_only {
+		_, err := db.Exec("insert into transacoes (cliente_id, valor, descricao, tipo, saldo) values ($1, $2, $3, $4, 0)", id, transacao.Valor, transacao.Descricao, transacao.Tipo)
 		if err != nil {
-			if strings.Contains(err.Error(), "not-null constraint") {
-				w.WriteHeader(http.StatusNotFound)
-				w.Write([]byte("404 - Cliente nao encontrado"))
-			} else {
-				fmt.Println(err)
-				w.WriteHeader(http.StatusInternalServerError)
-				w.Write([]byte("500 - Internal Server Error"))
-			}
+			fmt.Println(err)
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("500 - Internal Server Error - " + err.Error()))
 			return
 		}
 	} else {
-		err := db.QueryRow(`with novo_saldo as (UPDATE saldos SET saldo = saldo - $1 WHERE cliente_id = $2 RETURNING saldo) insert into transacoes (cliente_id, valor, descricao, tipo, saldo) values ($3, $4, $5, $6, (select * from novo_saldo)) returning saldo`, transacao.Valor, id, id, transacao.Valor, transacao.Descricao, transacao.Tipo).Scan(&saldo)
-		if err != nil {
-			if strings.Contains(err.Error(), "not-null constraint") {
-				w.WriteHeader(http.StatusNotFound)
-				w.Write([]byte("404 - Cliente nao encontrado"))
-			} else if strings.Contains(err.Error(), "check constraint") {
-				w.WriteHeader(http.StatusUnprocessableEntity)
-				w.Write([]byte("422 - Sem saldo"))
-			} else {
-				fmt.Println(err)
-				w.WriteHeader(http.StatusInternalServerError)
-				w.Write([]byte("500 - Internal Server Error"))
+		if transacao.Tipo == "c" {
+			err := db.QueryRow("with novo_saldo as (UPDATE saldos SET saldo = saldo + $1 WHERE cliente_id = $2 RETURNING saldo) insert into transacoes (cliente_id, valor, descricao, tipo, saldo) values ($3, $4, $5, $6, (select * from novo_saldo)) returning saldo", transacao.Valor, id, id, transacao.Valor, transacao.Descricao, transacao.Tipo).Scan(&saldo)
+			if err != nil {
+				if strings.Contains(err.Error(), "not-null constraint") {
+					w.WriteHeader(http.StatusNotFound)
+					w.Write([]byte("404 - Cliente nao encontrado"))
+				} else {
+					fmt.Println(err)
+					w.WriteHeader(http.StatusInternalServerError)
+					w.Write([]byte("500 - Internal Server Error - " + err.Error()))
+				}
+				return
 			}
-			return
+		} else {
+			err := db.QueryRow("with novo_saldo as (UPDATE saldos SET saldo = saldo - $1 WHERE cliente_id = $2 RETURNING saldo) insert into transacoes (cliente_id, valor, descricao, tipo, saldo) values ($3, $4, $5, $6, (select * from novo_saldo)) returning saldo", transacao.Valor, id, id, transacao.Valor, transacao.Descricao, transacao.Tipo).Scan(&saldo)
+			if err != nil {
+				if strings.Contains(err.Error(), "not-null constraint") {
+					w.WriteHeader(http.StatusNotFound)
+					w.Write([]byte("404 - Cliente nao encontrado"))
+				} else if strings.Contains(err.Error(), "check constraint") {
+					w.WriteHeader(http.StatusUnprocessableEntity)
+					w.Write([]byte("422 - Sem saldo"))
+				} else {
+					fmt.Println(err)
+					w.WriteHeader(http.StatusInternalServerError)
+					w.Write([]byte("500 - Internal Server Error - " + err.Error()))
+				}
+				return
+			}
 		}
 	}
 
@@ -150,7 +208,7 @@ func handle_transacoes(w http.ResponseWriter, r *http.Request, id int) {
 	if err != nil {
 		fmt.Println(err)
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("500 - Internal Server Error"))
+		w.Write([]byte("500 - Internal Server Error - " + err.Error()))
 		return
 	}
 
@@ -159,11 +217,16 @@ func handle_transacoes(w http.ResponseWriter, r *http.Request, id int) {
 
 // GET /clientes/[id]/extrato
 func handle_extrato(w http.ResponseWriter, r *http.Request, id int) {
+	if modo_ping_validacao_on || modo_ping_transacoes_only || modo_ping_transacoes_insert_only {
+		io.WriteString(w, "{\"saldo\": {\"total\": -9098,\"data_extrato\": \"2024-01-17T02:34:41.217753Z\",\"limite\":100000},\"ultimas_transacoes\": [{\"valor\": 10,\"tipo\":\"c\",\"descricao\":\"descricao\",\"realizada_em\":\"2024-01-17T02:34:38.543030Z\"}]}")
+		return
+	}
+
 	rows, err := db.Query(`select valor, tipo, descricao, data_hora_inclusao, saldo from transacoes where cliente_id = $1 order by data_hora_inclusao desc limit 10`, id)
 	if err, ok := err.(*pq.Error); ok {
 		fmt.Println(err)
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("500 - Internal Server Error"))
+		w.Write([]byte("500 - Internal Server Error - " + err.Error()))
 		return
 	}
 
@@ -173,10 +236,12 @@ func handle_extrato(w http.ResponseWriter, r *http.Request, id int) {
 	for rows.Next() {
 		var transacao ExtratoTransacao
 		err = rows.Scan(&transacao.Valor, &transacao.Tipo, &transacao.Descricao, &transacao.Data_Hora_Inclusao, &transacao.Saldo)
-		if err != nil {
+		if err == sql.ErrNoRows {
+			break
+		} else if err != nil {
 			fmt.Println(err)
 			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte("500 - Internal Server Error"))
+			w.Write([]byte("500 - Internal Server Error - " + err.Error()))
 			return
 		}
 		if extratoSaldo.Data_Extrato == "" {
@@ -186,6 +251,7 @@ func handle_extrato(w http.ResponseWriter, r *http.Request, id int) {
 		}
 		transacoes = append(transacoes, transacao)
 	}
+	rows.Close()
 
 	// nao foi encontrato nenhuma linha de extrato. Isso tambem pode ocorrer se o id eh inexistente
 	if len(transacoes) == 0 {
@@ -209,7 +275,7 @@ func handle_extrato(w http.ResponseWriter, r *http.Request, id int) {
 	if err != nil {
 		fmt.Println(err)
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("500 - Internal Server Error"))
+		w.Write([]byte("500 - Internal Server Error - " + err.Error()))
 		return
 	}
 	io.WriteString(w, string(jsonStr[:]))
@@ -242,7 +308,8 @@ func obter_cliente_limite_cache(id int) int {
 		var limite_db int
 		err := db.QueryRow(`SELECT limite FROM clientes WHERE cliente_id = $1`, id).Scan(&limite_db)
 		if err != nil {
-			fmt.Println(err)
+			fmt.Printf("Erro ao obter limite do cliente %d - %s\n", id, err.Error())
+			clientesDadosAtualizando = false
 			return -1
 		}
 		clientesLimites[id] = limite_db
@@ -264,7 +331,8 @@ func obter_cliente_saldo_inicial_cache(id int) int {
 		var saldo_inicial_db int
 		err := db.QueryRow(`SELECT saldo_inicial FROM clientes WHERE cliente_id = $1`, id).Scan(&saldo_inicial_db)
 		if err != nil {
-			fmt.Println(err)
+			fmt.Printf("Erro ao obter saldo_inicial do cliente %d - %s", id, err.Error())
+			clientesDadosAtualizando = false
 			return -1
 		}
 		clientesSaldosIniciais[id] = saldo_inicial_db
