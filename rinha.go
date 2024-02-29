@@ -3,8 +3,8 @@ package main
 import (
 	"bytes"
 	"database/sql"
-	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lib/pq"
+	_ "github.com/lib/pq"
 )
 
 var db *sql.DB
@@ -25,6 +25,7 @@ var modo_ping_on = false
 var modo_ping_validacao_on = false
 var modo_ping_transacoes_only = false
 var modo_ping_transacoes_insert_only = false
+var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
 
 func init() {
 	db_username := os.Getenv("DB_USERNAME")
@@ -58,15 +59,16 @@ func init() {
 	fmt.Println("DB_NAME:" + db_name)
 	fmt.Println("DB_USERNAME:" + db_username)
 	fmt.Println("DB_MAX_CONNECTIONS:" + db_max_connections_str)
+	fmt.Println("VERSAO:1.2.0")
 
 	db, err = sql.Open("postgres", "postgres://"+db_username+":"+db_password+"@"+db_hostname+"/"+db_name+"?sslmode=disable")
-	db.SetMaxOpenConns(db_max_connections)
 	if err != nil {
 		log.Fatal("Invalid DB config:", err)
 	}
 	if err = db.Ping(); err != nil {
 		log.Fatal("DB unreachable:", err)
 	}
+	db.SetMaxOpenConns(db_max_connections)
 	fmt.Println("Conectado OK!!!")
 
 	if os.Getenv("PING_ON") != "" {
@@ -118,6 +120,106 @@ func handle_health(w http.ResponseWriter, r *http.Request) {
 	return
 }
 
+func parse_request(request []byte) (Transacao, error) {
+	var tamanho_array = len(request)
+	var params = make(map[string]string)
+outer:
+	for i := 0; i < tamanho_array; i++ {
+		if request[i] == '"' {
+			// comecou um atributo. ir acumulando ate chegar no proximo '"'
+			var chave strings.Builder
+			for j := i + 1; j < tamanho_array; j++ {
+				if request[j] == '"' {
+					for k := j + 1; k < tamanho_array; k++ {
+						if request[k] == ':' {
+							var valor strings.Builder
+							for w := k + 1; w < tamanho_array; w++ {
+								if request[w] == ',' || request[w] == '}' {
+									params[chave.String()] = valor.String()
+									i = w + 1
+									continue outer
+								} else {
+									valor.WriteByte(request[w])
+								}
+							}
+						}
+					}
+					// achou toda a chave, agora pegar o valor
+				} else {
+					chave.WriteByte(request[j])
+				}
+			}
+		}
+	}
+
+	valor_str, ok_valor := params["valor"]
+	if !ok_valor {
+		return Transacao{}, errors.New("valor nao informado")
+	}
+
+	valor, err := strconv.Atoi(strings.Trim(valor_str, " "))
+	if err != nil {
+		fmt.Println("Erro ao tratar json de entrada - " + err.Error())
+		return Transacao{}, errors.New("valor invalido")
+	}
+
+	tipo, ok := params["tipo"]
+	if !ok {
+		return Transacao{}, errors.New("tipo nao informado")
+	} else {
+		achou := false
+		tamanho := len(tipo)
+		var valor strings.Builder
+	outer_tipo:
+		for i := 0; i < tamanho; i++ {
+			if tipo[i] == '"' {
+				for j := i + 1; j < tamanho; j++ {
+					if tipo[j] == '"' {
+						tipo = valor.String()
+						achou = true
+						break outer_tipo
+					}
+					valor.WriteByte(tipo[j])
+				}
+			}
+		}
+		if !achou {
+			return Transacao{}, errors.New("tipo invalido")
+		}
+	}
+
+	descricao, ok := params["descricao"]
+	if !ok {
+		return Transacao{}, errors.New("descricao nao informada")
+	} else {
+		achou := false
+		tamanho := len(descricao)
+		var valor strings.Builder
+	outer_descricao:
+		for i := 0; i < tamanho; i++ {
+			if descricao[i] == '"' {
+				for j := i + 1; j < tamanho; j++ {
+					if descricao[j] == '"' {
+						descricao = valor.String()
+						achou = true
+						break outer_descricao
+					}
+					valor.WriteByte(descricao[j])
+				}
+			}
+		}
+		if !achou {
+			return Transacao{}, errors.New("descricao invalida")
+		}
+	}
+
+	return Transacao{
+		valor,
+		tipo,
+		descricao,
+	}, nil
+}
+
 // POST /clientes/[id]/transacoes
 func handle_transacoes(w http.ResponseWriter, r *http.Request, id int) {
 	var resB bytes.Buffer
@@ -128,12 +230,13 @@ func handle_transacoes(w http.ResponseWriter, r *http.Request, id int) {
 		return
 	}
 
-	var transacao Transacao
-	err = json.Unmarshal(resB.Bytes(), &transacao)
-	if err != nil {
-		fmt.Println("Erro ao tratar json de entrada - " + err.Error())
+	// var transacao Transacao
+	// err = json.Unmarshal(resB.Bytes(), &transacao)
+	var transacao, err_parse = parse_request(resB.Bytes())
+	if err_parse != nil {
+		fmt.Println("Erro ao tratar json de entrada - " + err_parse.Error())
 		w.WriteHeader(http.StatusUnprocessableEntity)
-		w.Write([]byte("422 - Erro ao tratar json de entrada - " + err.Error()))
+		w.Write([]byte("422 - Erro ao tratar json de entrada - " + err_parse.Error()))
 		return
 	}
 
@@ -161,7 +264,7 @@ func handle_transacoes(w http.ResponseWriter, r *http.Request, id int) {
 		return
 	}
 
-	var saldo int
+	var saldo string
 	if modo_ping_transacoes_insert_only {
 		_, err := db.Exec("insert into transacoes (cliente_id, valor, descricao, tipo, saldo) values ($1, $2, $3, $4, 0)", id, transacao.Valor, transacao.Descricao, transacao.Tipo)
 		if err != nil {
@@ -190,7 +293,7 @@ func handle_transacoes(w http.ResponseWriter, r *http.Request, id int) {
 				if strings.Contains(err.Error(), "not-null constraint") {
 					w.WriteHeader(http.StatusNotFound)
 					w.Write([]byte("404 - Cliente nao encontrado"))
-				} else if strings.Contains(err.Error(), "check constraint") {
+				} else if strings.Contains(err.Error(), "check constraint") || strings.Contains(err.Error(), "saldo_valido") {
 					w.WriteHeader(http.StatusUnprocessableEntity)
 					w.Write([]byte("422 - Sem saldo"))
 				} else {
@@ -203,16 +306,23 @@ func handle_transacoes(w http.ResponseWriter, r *http.Request, id int) {
 		}
 	}
 
-	transacaoResposta := TransacaoResposta{obter_cliente_limite_cache(id), saldo}
-	jsonStr, err := json.Marshal(transacaoResposta)
-	if err != nil {
-		fmt.Println(err)
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("500 - Internal Server Error - " + err.Error()))
-		return
-	}
+	limite := obter_cliente_limite_cache(id)
+	// transacaoResposta := TransacaoResposta{limite, saldo}
+	// jsonStr, err := json.Marshal(transacaoResposta)
+	// if err != nil {
+	// 	fmt.Println(err)
+	// 	w.WriteHeader(http.StatusInternalServerError)
+	// 	w.Write([]byte("500 - Internal Server Error - " + err.Error()))
+	// 	return
+	// }
 
-	io.WriteString(w, string(jsonStr[:]))
+	var json strings.Builder
+	json.WriteString("{\"limite\":")
+	json.WriteString(strconv.Itoa(limite))
+	json.WriteString(",\"saldo\":")
+	json.WriteString(saldo)
+	json.WriteString("}")
+	io.WriteString(w, json.String())
 }
 
 // GET /clientes/[id]/extrato
@@ -222,17 +332,23 @@ func handle_extrato(w http.ResponseWriter, r *http.Request, id int) {
 		return
 	}
 
-	rows, err := db.Query(`select valor, tipo, descricao, data_hora_inclusao, saldo from transacoes where cliente_id = $1 order by data_hora_inclusao desc limit 10`, id)
-	if err, ok := err.(*pq.Error); ok {
-		fmt.Println(err)
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("500 - Internal Server Error - " + err.Error()))
-		return
+	rows, err := db.Query("select valor, tipo, descricao, data_hora_inclusao, saldo from transacoes where cliente_id = $1 order by data_hora_inclusao desc limit 10", id)
+	if err != nil {
+		if err != sql.ErrNoRows {
+			fmt.Println(err)
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("500 - Internal Server Error - " + err.Error()))
+			return
+		}
 	}
 
+	var json strings.Builder
+	json.WriteString("{\"saldo\":{\"total\":")
+
+	var achou_linhas = false
+	var primeira_linha = true
+	var escreveu_extrato = false
 	data_extrato_str := time.Now().Format("2006-01-02T15:04:05.000000Z")
-	var extratoSaldo ExtratoSaldo
-	var transacoes []ExtratoTransacao
 	for rows.Next() {
 		var transacao ExtratoTransacao
 		err = rows.Scan(&transacao.Valor, &transacao.Tipo, &transacao.Descricao, &transacao.Data_Hora_Inclusao, &transacao.Saldo)
@@ -244,41 +360,51 @@ func handle_extrato(w http.ResponseWriter, r *http.Request, id int) {
 			w.Write([]byte("500 - Internal Server Error - " + err.Error()))
 			return
 		}
-		if extratoSaldo.Data_Extrato == "" {
-			extratoSaldo.Total = transacao.Saldo
-			extratoSaldo.Data_Extrato = data_extrato_str
-			extratoSaldo.Limite = obter_cliente_limite_cache(id)
+		if !escreveu_extrato {
+			json.WriteString(strconv.Itoa(transacao.Saldo))
+			json.WriteString(",\"data_extrato\":\"")
+			json.WriteString(data_extrato_str)
+			json.WriteString("\",\"limite\":")
+			json.WriteString(strconv.Itoa(obter_cliente_limite_cache(id)))
+			json.WriteString("},\"ultimas_transacoes\":[")
+			escreveu_extrato = true
 		}
-		transacoes = append(transacoes, transacao)
+
+		if !primeira_linha {
+			json.WriteString(",")
+		}
+		json.WriteString("{\"valor\":")
+		json.WriteString(strconv.Itoa(transacao.Valor))
+		json.WriteString(",\"tipo\":\"")
+		json.WriteString(transacao.Tipo)
+		json.WriteString("\",\"descricao\":\"")
+		json.WriteString(transacao.Descricao)
+		json.WriteString("\",\"realizada_em\":\"")
+		json.WriteString(transacao.Data_Hora_Inclusao)
+		json.WriteString("\"}")
+		primeira_linha = false
+		achou_linhas = true
 	}
 	rows.Close()
 
-	// nao foi encontrato nenhuma linha de extrato. Isso tambem pode ocorrer se o id eh inexistente
-	if len(transacoes) == 0 {
-		limite := obter_cliente_limite_cache(id)
-		if limite == -1 {
+	if achou_linhas {
+		json.WriteString("]}")
+	} else {
+		var saldoInicial = obter_cliente_saldo_inicial_cache(id)
+		if saldoInicial == -1 {
 			w.WriteHeader(http.StatusNotFound)
 			w.Write([]byte("404 - Cliente nao encontrado"))
 			return
+		} else {
+			json.WriteString(strconv.Itoa(saldoInicial))
+			json.WriteString(",\"data_extrato\":\"")
+			json.WriteString(data_extrato_str)
+			json.WriteString("\",\"limite\":")
+			json.WriteString(strconv.Itoa(obter_cliente_limite_cache(id)))
+			json.WriteString("}}")
 		}
-		extratoSaldo.Total = obter_cliente_saldo_inicial_cache(id)
-		extratoSaldo.Data_Extrato = data_extrato_str
-		extratoSaldo.Limite = limite
 	}
-
-	extrato := Extrato{
-		extratoSaldo,
-		transacoes,
-	}
-
-	jsonStr, err := json.Marshal(extrato)
-	if err != nil {
-		fmt.Println(err)
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("500 - Internal Server Error - " + err.Error()))
-		return
-	}
-	io.WriteString(w, string(jsonStr[:]))
+	io.WriteString(w, json.String())
 }
 
 func obter_dados_rota(url string) (int, string) {
@@ -306,7 +432,7 @@ func obter_cliente_limite_cache(id int) int {
 	if !ok {
 		clientesDadosAtualizando = true
 		var limite_db int
-		err := db.QueryRow(`SELECT limite FROM clientes WHERE cliente_id = $1`, id).Scan(&limite_db)
+		err := db.QueryRow("SELECT limite FROM clientes WHERE cliente_id = $1", id).Scan(&limite_db)
 		if err != nil {
 			fmt.Printf("Erro ao obter limite do cliente %d - %s\n", id, err.Error())
 			clientesDadosAtualizando = false
@@ -323,13 +449,14 @@ func obter_cliente_limite_cache(id int) int {
 
 func obter_cliente_saldo_inicial_cache(id int) int {
 	for clientesDadosAtualizando {
+		fmt.Printf("Aguardando atualizacao do cache por 10 milis")
 		time.Sleep(10 * time.Millisecond)
 	}
 	saldo_inicial, ok := clientesSaldosIniciais[id]
 	if !ok {
 		clientesDadosAtualizando = true
 		var saldo_inicial_db int
-		err := db.QueryRow(`SELECT saldo_inicial FROM clientes WHERE cliente_id = $1`, id).Scan(&saldo_inicial_db)
+		err := db.QueryRow("SELECT saldo_inicial FROM clientes WHERE cliente_id = $1", id).Scan(&saldo_inicial_db)
 		if err != nil {
 			fmt.Printf("Erro ao obter saldo_inicial do cliente %d - %s", id, err.Error())
 			clientesDadosAtualizando = false

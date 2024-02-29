@@ -1,4 +1,4 @@
-create table transacoes (
+create unlogged table transacoes (
     cliente_id int not null,
     valor numeric not null,
     descricao varchar(10) not null,

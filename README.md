@@ -45,5 +45,24 @@ docker run -it --rm --net="host" rinha-backend-2024-q1-go
 docker tag rinha-backend-2024-q1-go hfurlan/rinha-backend-2024-q1:1.0.0-go
 docker push hfurlan/rinha-backend-2024-q1:1.0.0-go
 
+# Profiling
+
+--build
+go build rinha.go
+
+--run wit profiling
+HTTP_PORT=9999 ./rinha -cpuprofile=rinha.prof
+
+--run stress test
+
+
+--run profiler
+go tool pprof rinha rinha.prof
+
+# MySQL
+
+go get github.com/go-sql-driver/mysql
+
+
 
 
