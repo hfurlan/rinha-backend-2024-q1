@@ -42,8 +42,8 @@ docker run -it --rm --net="host" rinha-backend-2024-q1-go
 
 # Push to Docker Hub
 
-docker tag rinha-backend-2024-q1-go hfurlan/rinha-backend-2024-q1:1.0.0-go
-docker push hfurlan/rinha-backend-2024-q1:1.0.0-go
+docker tag rinha-backend-2024-q1-go hfurlan/rinha-backend-2024-q1:2.0.0-go
+docker push hfurlan/rinha-backend-2024-q1:2.0.0-go
 
 # Profiling
 
